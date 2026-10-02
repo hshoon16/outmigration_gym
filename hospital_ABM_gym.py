@@ -37,7 +37,7 @@ class ABMenv_gym(gym.Env):
         self.individual_rewards = np.zeros(self.num_hospitals, dtype=np.float32)
         self.cumulative_individual_rewards = np.zeros(self.num_hospitals, dtype=np.float32)
 
-        # 우선 binary (0: 투자 x, 1: 투자)
+        # 우선 binary action (0: 투자 x, 1: 투자)
         self.action_space = spaces.MultiBinary(self.num_hospitals)
 
         self.observation_space = spaces.Dict({
@@ -74,12 +74,11 @@ class ABMenv_gym(gym.Env):
 
     def step(self, joint_action):
         joint_action = np.asarray(joint_action, dtype=np.int8)
-        # 추후 투자 효과가 정해지면, 그에따른 reward 생성 추가 필요
         self.sim.advance_one_timestep(self.current_step)
         self.last_actions = joint_action.copy()
         self.last_new_patient_counts = self._new_patient_counts()
 
-        # lines 86-88는 무시 (임의임)
+        # lines 82-84는 임의의 reward (추후 수정 필요, reward stepwise화) 
         self.individual_rewards = (
             self.last_new_patient_counts.astype(np.float32)
             - self.investment_cost * self.last_actions.astype(np.float32))
@@ -94,7 +93,7 @@ class ABMenv_gym(gym.Env):
 
         return obs, 0.0, terminated, False, info
 
-    def state(self): # 추후 수정
+    def state(self): # 추후 병원이 decision시 고려할 정보가 확정되면 맞춰 수정
         return np.column_stack((
             self.sim.df_Hospital_info["OQ_objective_quality"].to_numpy(dtype=np.float32),
             np.mean(self.sim.arr_population_choice_prob, axis=0, dtype=np.float32),
