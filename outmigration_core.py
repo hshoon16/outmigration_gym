@@ -169,7 +169,7 @@ def load_simulation_inputs(data_dir="."):
 def make_default_parameter_set(df_city_info, df_hospital_crd):
     return EasyDict({
         'max_dt': 100,
-        'n_p': 28,
+        'n_p': 40,
         # 2026-09-28: 신규 cancer patient가 active cancer 상태를 유지하는 timestep 수
         'cancer_duration': 10,
         'df_city_info': df_city_info,
@@ -191,6 +191,19 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
         'dict_parameter_initial_PRQ': {
             'SM': 2.90, 'YN': 2.57, 'HN': 2.31, 'CC': 2.07, 'GW': 2.31,
         },
+        # 2026-10-06: 기본 모드는 기존 동작을 유지하며, fixed_prq에서만 Version 1 실험 경로를 사용한다.
+        'quality_model_version': 'fixed_prq', # default, fixed_prq
+        # 2026-10-06: Version 1의 고정 calibrated PRQ 값(기존 default PRQ와 분리해 기존 모드 결과를 보존).
+        'dict_parameter_fixed_PRQ': {
+            'SM': 2.90, 'YN': 2.56, 'HN': 2.31, 'CC': 2.07, 'GW': 2.31,
+        },
+        # 2026-10-06: 별도 계수가 없으면 기존 beta_PQ를 PRQ/PHQ 계수로 공통 사용한다.
+        'beta_PRQ': None,
+        'beta_PHQ': None,
+        # 2026-10-06: fixed_prq에서 PHQ의 지역별 평균 변화가 RQ에 반영되는 비율이다.
+        'eta_RQ_from_PHQ': 1.0,
+        # 2026-10-06: fixed_prq에서 PRQ 및 choice probability 합 검증을 활성화한다.
+        'validate_fixed_prq': True,
 
         # 2026-09-16: Volume-Outcome Relationship (VOR) parameters
         'vor_K' : 5,
@@ -198,7 +211,7 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
         'gamma_beta' : 2.0,
         # 2026-09-18: 기본 VOR 최대 효과와 half-saturation 기준(실제 적용 시 병원 수로 재계산)
         'Q_vmax' : 2.0,
-        'S_half' : 1 / 47,
+        'S_half' : 1 / 100,
         # 2026-09-21: 병원별 고정 base OHQ를 calibrated 초기 PRQ 주변에서 생성하는 표준편차
         'sigma_base_OHQ': 0.02,
 
@@ -222,11 +235,11 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
         'n_s': 10,
         'n_c': 50,
         'sigma_wom': 0.01,
-        'mu_hc': 0.32, # test
+        'mu_hc': 0.8, # test
         'lambda_c': 1.5,
         'mu_hs': 0.2,
         'lambda_s': 1.5,
-        'mu_rc': 0.32, # test
+        'mu_rc': 0.8, # test
         'mu_rs': 0.1,
         'mu_rn': 0.1,
         'wom_update_mode': 'synchronous_vectorized',
@@ -248,6 +261,14 @@ class Simulation:
         self.arr_population_PRQ = np.full((self.num_population,len(self.parameter_set.dict_parameter_initial_PRQ)), -1.0)
         self.arr_population_choice_prob = np.zeros((self.num_population,self.num_hospital))  # [2026-09-07 calculate choice probability]: Simulation-level choice probability 공유 배열
         self.arr_population_CancerOrNot = np.full(self.num_population, False)
+        # 2026-10-06: fixed_prq의 immutable PRQ와 PHQ 기반으로 동적으로 갱신되는 RQ 상태를 분리해 보관한다.
+        self.arr_population_fixed_PRQ = None
+        self.arr_population_initial_PRQ = None
+        self.arr_population_RQ = None
+        self.arr_population_prev_mean_PHQ_by_region = None
+        self.arr_population_fixed_choice_prob_region = None
+        self.arr_population_choice_prob_region_by_region = None
+        self.last_RQ_delta = None
         # 2026-10-02: 신규 cancer patient의 1회성 recognition 대상을 Simulation-level Boolean 배열로 관리한다.
         self.arr_population_is_new_cancerpatient = np.full(self.num_population, False)
         # 2026-09-28: 사람별 active cancer 종료 timestep; -1은 현재 non-cancer 상태를 뜻한다.
@@ -271,6 +292,8 @@ class Simulation:
             (self.parameter_set.max_dt, self.num_hospital), dtype=float
         )
         self.action_OHQ = np.zeros(self.num_hospital, dtype=float)
+        # 2026-10-06: Version 1의 reinvestment 항은 아직 구현하지 않아 항상 0으로 유지한다.
+        self.reinvestment_OHQ = np.zeros(self.num_hospital, dtype=float)
 
         action_effect_K = int(self.parameter_set.action_effect_K) # time lag
         action_alpha = float(self.parameter_set.action_inv_gamma_alpha) #inverse gamma function의 param
@@ -491,6 +514,12 @@ class Simulation:
         self.achv_base_OHQ = np.zeros((self.parameter_set.max_dt, self.num_hospital))
         self.achv_vor_OHQ = np.zeros((self.parameter_set.max_dt, self.num_hospital))
         self.achv_action_OHQ = np.zeros((self.parameter_set.max_dt, self.num_hospital))
+        # 2026-10-06: Version 1의 OHQ 분해를 위해 현재 0인 reinvestment 성분도 archive한다.
+        self.achv_reinvestment_OHQ = np.zeros((self.parameter_set.max_dt, self.num_hospital))
+        # 2026-10-06: fixed_prq의 RQ 변화를 사후 분석할 수 있도록 archive를 추가한다.
+        self.achv_population_RQ = np.full(
+            (self.parameter_set.max_dt, self.num_population, self.num_region), np.nan
+        )
 
         self.achv_population_choice_prob[0] = self.arr_population_choice_prob  # [2026-09-07 calculate choice probability]: Simulation-level choice probability archive 초기화
         self.achv_mean_hospital_choice_prob[0] = np.mean(self.arr_population_choice_prob, axis=0)  # [2026-09-16] : VOR을 사용하기 위한 timestep별 병원 선택량 초기화
@@ -501,6 +530,9 @@ class Simulation:
         self.achv_base_OHQ[0] = self.base_OHQ
         self.achv_vor_OHQ[0] = self.vor_OHQ
         self.achv_action_OHQ[0] = self.action_OHQ
+        self.achv_reinvestment_OHQ[0] = self.reinvestment_OHQ
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            self.achv_population_RQ[0] = self.arr_population_RQ
 
 
     def update_Archive(self, dt):
@@ -515,6 +547,9 @@ class Simulation:
         self.achv_base_OHQ[dt] = self.base_OHQ
         self.achv_vor_OHQ[dt] = self.vor_OHQ
         self.achv_action_OHQ[dt] = self.action_OHQ
+        self.achv_reinvestment_OHQ[dt] = self.reinvestment_OHQ
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            self.achv_population_RQ[dt] = self.arr_population_RQ
 
     # Initial Setting
     def set_OHQ(self):
@@ -529,10 +564,15 @@ class Simulation:
         #     1.0,
         # )
         
-        # 2026-09-28 base OHQ 1로 고정
-        self.base_OHQ = np.ones(self.num_hospital) 
+        # 2026-10-06: Version 1 fixed_prq에서는 모든 병원의 고정 base OHQ를 1.0으로 둔다.
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            self.base_OHQ = np.ones(self.num_hospital)
+        else:
+            # 기존 기본 동작을 보존한다.
+            self.base_OHQ = np.ones(self.num_hospital)
         self.vor_OHQ.fill(0.0)
         self.action_OHQ.fill(0.0)
+        self.reinvestment_OHQ.fill(0.0)
         # 2026-09-21: dt=0 VOR는 PHQ/OHQ 없이 초기 PRQ와 지역 거리만으로 만든 가상 과거 선택확률을 사용한다.
         self.calculate_virtual_choice_prob()
         self.VOR_effect(self.parameter_set.Q_vmax, dt=0)
@@ -548,13 +588,24 @@ class Simulation:
             ),
             0.0, 3.0
         )
-        initial_PRQ = np.asarray(list(self.parameter_set.dict_parameter_initial_PRQ.values()))
-        self.arr_population_PRQ[:] = np.clip(
-            initial_PRQ[np.newaxis, :] + np.random.normal(
-                0, self.parameter_set.sigma_PRQ, (self.num_population, self.num_region)
-            ),
-            0.0, 3.0
-        )
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            # 2026-10-06: Version 1 PRQ는 calibrated 값으로 초기화한 뒤 episode 동안 절대 갱신하지 않는다.
+            fixed_PRQ = np.asarray(
+                list(self.parameter_set.dict_parameter_fixed_PRQ.values()), dtype=float
+            )
+            self.arr_population_PRQ[:] = fixed_PRQ[np.newaxis, :]
+            # 2026-10-06: PRQ baseline은 immutable하게 두고, RQ는 이후 PHQ 변화에 따라 별도로 갱신한다.
+            self.arr_population_initial_PRQ = self.arr_population_PRQ.copy()
+            self.arr_population_fixed_PRQ = self.arr_population_initial_PRQ
+            self.arr_population_RQ = self.arr_population_initial_PRQ.copy()
+        else:
+            initial_PRQ = np.asarray(list(self.parameter_set.dict_parameter_initial_PRQ.values()))
+            self.arr_population_PRQ[:] = np.clip(
+                initial_PRQ[np.newaxis, :] + np.random.normal(
+                    0, self.parameter_set.sigma_PRQ, (self.num_population, self.num_region)
+                ),
+                0.0, 3.0
+            )
 
         # 2026-09-11: Shapely Point.distance와 동일한 평면 좌표 거리식을 broadcasting으로 계산
         person_coords = np.array([[coord.x, coord.y] for coord in self.df_Person_info.coord.values])
@@ -576,6 +627,11 @@ class Simulation:
         # 2026-09-11: region 거리효과(P, R)를 choice utility에서 사용할 hospital 축(P, H)으로만 매핑
         self.arr_distance_effect_region_hospital = self.arr_distance_effect_region[:, self.arr_hospital_region]
 
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            # 2026-10-06: RQ update의 기준점으로 초기 PHQ의 지역별 평균을 저장한다.
+            self.arr_population_prev_mean_PHQ_by_region = self.calculate_mean_PHQ_by_region()
+            self.calculate_fixed_choice_prob_region()
+
         # 2026-09-11: archive 호환에 필요한 상태만 shared population 배열의 row view로 연결
         for idx_person, person in enumerate(self.arr_Person):
             person.PHQ = self.arr_population_PHQ[idx_person]
@@ -588,15 +644,66 @@ class Simulation:
 
         self.calculate_choice_prob_all()
 
+    def _beta_PRQ(self):
+        return self.parameter_set.beta_PQ if self.parameter_set.beta_PRQ is None else self.parameter_set.beta_PRQ
+
+    def _beta_PHQ(self):
+        return self.parameter_set.beta_PQ if self.parameter_set.beta_PHQ is None else self.parameter_set.beta_PHQ
+
+    def calculate_fixed_choice_prob_region(self):
+        """Compute fixed_prq regional probabilities from the current dynamic RQ state."""
+        # 2026-10-06: PRQ는 고정하지만, RQ와 지역 거리효과로 P(region)을 매 timestep 재계산한다.
+        utility_region = (
+            self.arr_population_RQ * self._beta_PRQ()
+            + self.arr_distance_effect_region * self.parameter_set.beta_d
+        )
+        exp_utility_region = np.exp(utility_region)
+        self.arr_population_choice_prob_region_by_region = exp_utility_region / np.sum(
+            exp_utility_region, axis=1, keepdims=True
+        )
+        # 기존 이름은 external analysis 코드 호환을 위해 현재 RQ 기반 확률의 alias로 유지한다.
+        self.arr_population_fixed_choice_prob_region = self.arr_population_choice_prob_region_by_region
+        if self.parameter_set.validate_fixed_prq and not np.allclose(
+            self.arr_population_choice_prob_region_by_region.sum(axis=1), 1.0
+        ):
+            raise AssertionError("fixed_prq regional choice probabilities must sum to one.")
+
+    def calculate_mean_PHQ_by_region(self):
+        """Return each person's mean PHQ for each hospital region."""
+        # 2026-10-06: (P, H) PHQ를 region별 병원 평균인 (P, R)로 변환한다.
+        return np.column_stack([
+            self.arr_population_PHQ[:, idx_hospital].mean(axis=1)
+            for idx_hospital in self.idx_hospital_in_region
+        ])
+
+    def update_RQ_from_PHQ(self):
+        """Accumulate regional attractiveness changes caused by updated PHQ."""
+        if self.parameter_set.quality_model_version != 'fixed_prq':
+            return
+        # 2026-10-06: 현재/직전 지역별 mean PHQ 차이만 eta 비율로 RQ에 누적한다; RQ에는 임의 clip을 적용하지 않는다.
+        current_mean_PHQ = self.calculate_mean_PHQ_by_region()
+        previous_RQ = self.arr_population_RQ.copy()
+        self.last_RQ_delta = self.parameter_set.eta_RQ_from_PHQ * (
+            current_mean_PHQ - self.arr_population_prev_mean_PHQ_by_region
+        )
+        self.arr_population_RQ += self.last_RQ_delta
+        self.arr_population_prev_mean_PHQ_by_region = current_mean_PHQ
+        if self.parameter_set.validate_fixed_prq:
+            if not np.array_equal(self.arr_population_PRQ, self.arr_population_initial_PRQ):
+                raise AssertionError("fixed_prq initial PRQ changed during the episode.")
+            if not np.allclose(self.arr_population_RQ, previous_RQ + self.last_RQ_delta):
+                raise AssertionError("fixed_prq RQ update does not match the PHQ-change formula.")
+
     # [2026-09-07 calculate choice probability]: 모든 person의 utility를 (P, H) NumPy 연산으로 계산
     def calculate_utility_all(self):
-        arr_PRQ_hospital = self.arr_population_PRQ[:, self.arr_hospital_region]
-        self.arr_utility_region = (
-            arr_PRQ_hospital * self.parameter_set.beta_PQ
-            + self.arr_distance_effect_region_hospital * self.parameter_set.beta_d
-        )
+        if self.parameter_set.quality_model_version != 'fixed_prq':
+            arr_PRQ_hospital = self.arr_population_PRQ[:, self.arr_hospital_region]
+            self.arr_utility_region = (
+                arr_PRQ_hospital * self._beta_PRQ()
+                + self.arr_distance_effect_region_hospital * self.parameter_set.beta_d
+            )
         self.arr_utility_hospital = (
-            self.arr_population_PHQ * self.parameter_set.beta_PQ
+            self.arr_population_PHQ * self._beta_PHQ()
             + self.arr_distance_effect_hospital * self.parameter_set.beta_d
         )
 
@@ -604,12 +711,19 @@ class Simulation:
     def calculate_choice_prob_all(self):
         self.calculate_utility_all()
 
-        if self.parameter_set.pi != 0:
-            exp_u_region = np.exp(self.arr_utility_region)
-            regional_denominator = np.sum(
-                exp_u_region[:, self.idx_representative_hospital_by_region], axis=1
-            )
-            self.arr_population_choice_prob_region = exp_u_region / regional_denominator[:, np.newaxis]
+        if self.parameter_set.pi != 0 or self.parameter_set.quality_model_version == 'fixed_prq':
+            if self.parameter_set.quality_model_version == 'fixed_prq':
+                # 2026-10-06: fixed_prq의 regional probability는 고정 PRQ가 아니라 최신 RQ로 매번 계산한다.
+                self.calculate_fixed_choice_prob_region()
+                self.arr_population_choice_prob_region = (
+                    self.arr_population_choice_prob_region_by_region[:, self.arr_hospital_region]
+                )
+            else:
+                exp_u_region = np.exp(self.arr_utility_region)
+                regional_denominator = np.sum(
+                    exp_u_region[:, self.idx_representative_hospital_by_region], axis=1
+                )
+                self.arr_population_choice_prob_region = exp_u_region / regional_denominator[:, np.newaxis]
 
             exp_u_hospital = np.exp(self.arr_utility_hospital * self.parameter_set.pi)
             sum_exp_by_region = np.zeros((self.num_population, self.num_region))
@@ -625,6 +739,11 @@ class Simulation:
                 self.arr_population_choice_prob_region
                 * self.arr_population_choice_prob_hospital
             )
+            if self.parameter_set.quality_model_version == 'fixed_prq':
+                if self.parameter_set.validate_fixed_prq and not np.allclose(
+                    self.arr_population_choice_prob.sum(axis=1), 1.0
+                ):
+                    raise AssertionError("fixed_prq hospital choice probabilities must sum to one.")
         else:
             exp_u_hospital = np.exp(self.arr_utility_hospital)
             inf_mask = exp_u_hospital == np.inf
@@ -762,22 +881,25 @@ class Simulation:
 
         chosen_hospital = self.df_Person_info.idx_chosen_hospital.to_numpy()[idx_new_patient]
         chosen_region = self.df_Person_info.idx_region_chosen_hospital.to_numpy()[idx_new_patient]
-        if np.any(chosen_hospital < 0) or np.any(chosen_region < 0):
+        if np.any(chosen_hospital < 0) or (
+            self.parameter_set.quality_model_version != 'fixed_prq' and np.any(chosen_region < 0)
+        ):
             raise ValueError("New cancer patient must choose a hospital before recognition.")
 
         objective_quality = self.df_Hospital_info.OQ_objective_quality.to_numpy()
         recognition_noise_h = np.random.normal(0, self.parameter_set.sigma_recog, len(idx_new_patient))
-        recognition_noise_r = np.random.normal(0, self.parameter_set.sigma_recog, len(idx_new_patient))
         E_h[idx_new_patient, chosen_hospital] = (
             self.parameter_set.mu_recog
             * (objective_quality[chosen_hospital] - self.arr_population_PHQ[idx_new_patient, chosen_hospital])
             + recognition_noise_h
         )
-        E_r[idx_new_patient, chosen_region] = (
-            self.parameter_set.mu_recog
-            * (objective_quality[chosen_hospital] - self.arr_population_PRQ[idx_new_patient, chosen_region])
-            + recognition_noise_r
-        )
+        if self.parameter_set.quality_model_version != 'fixed_prq':
+            recognition_noise_r = np.random.normal(0, self.parameter_set.sigma_recog, len(idx_new_patient))
+            E_r[idx_new_patient, chosen_region] = (
+                self.parameter_set.mu_recog
+                * (objective_quality[chosen_hospital] - self.arr_population_PRQ[idx_new_patient, chosen_region])
+                + recognition_noise_r
+            )
 
         # 2026-10-02: recognition을 한 번 적용한 즉시 Simulation/Person의 신규 flag를 함께 해제한다.
         self.arr_population_is_new_cancerpatient[idx_new_patient] = False
@@ -788,21 +910,35 @@ class Simulation:
     # [2026-09-07 WOM]: C/S/N 효과를 모두 계산한 뒤 PHQ와 PRQ를 동시에 갱신
     def update_WOM_all(self, dt):
         C_h, S_h = self.calculate_C_h(), self.calculate_S_h()
-        # C_r, S_r, N_r = self.calculate_C_r(), self.calculate_S_r(), self.calculate_N_r_all()
-        C_r, S_r = self.calculate_C_r(), self.calculate_S_r()
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            # 2026-10-06: Version 1은 regional WOM과 regional recognition을 계산·반영하지 않는다.
+            C_r = np.zeros((self.num_population, self.num_region))
+            S_r = np.zeros((self.num_population, self.num_region))
+        else:
+            # C_r, S_r, N_r = self.calculate_C_r(), self.calculate_S_r(), self.calculate_N_r_all()
+            C_r, S_r = self.calculate_C_r(), self.calculate_S_r()
 
         # 2026-10-02: Person.PHQ/PRQ_recognition 호출 대신 population-level recognition 효과를 사용한다.
         E_h, E_r = self.calculate_recognition_all(dt)
 
+        # 2026-10-06: Version 1 PHQ는 초기화와 동일하게 [0, 3] 범위로 제한한다.
+        PHQ_upper_bound = 3.0 if self.parameter_set.quality_model_version == 'fixed_prq' else self.max_quality
         new_PHQ = np.clip(
             self.arr_population_PHQ + C_h + S_h + E_h + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PHQ.shape),
-            self.min_quality, self.max_quality
+            self.min_quality, PHQ_upper_bound
         )
-        new_PRQ = np.clip(
-            # self.arr_population_PRQ + C_r + S_r + N_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
-            self.arr_population_PRQ + C_r + S_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
-            self.min_quality, self.max_quality
-        )
+        if self.parameter_set.quality_model_version == 'fixed_prq':
+            # 2026-10-06: PRQ는 noise를 포함한 모든 timestep update를 건너뛰고 초기 calibrated 값 그대로 유지한다.
+            new_PRQ = self.arr_population_fixed_PRQ.copy()
+        else:
+            new_PRQ = np.clip(
+                # self.arr_population_PRQ + C_r + S_r + N_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
+                self.arr_population_PRQ + C_r + S_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
+                self.min_quality, self.max_quality
+            )
+        if self.parameter_set.quality_model_version == 'fixed_prq' and self.parameter_set.validate_fixed_prq:
+            if not np.array_equal(new_PRQ, self.arr_population_fixed_PRQ):
+                raise AssertionError("fixed_prq PRQ changed during WOM update.")
         self.arr_population_PHQ[:], self.arr_population_PRQ[:] = new_PHQ, new_PRQ
 
         for idx_person, person in enumerate(self.arr_Person):
@@ -853,7 +989,11 @@ class Simulation:
         for idx_person in self.idx_new_patient:
             self.arr_Person[idx_person].is_cancerpatient = True
             self.arr_Person[idx_person].is_new_cancerpatient = True
-            self.arr_Person[idx_person].calculate_choice_prob()
+            if self.parameter_set.quality_model_version == 'fixed_prq':
+                # 2026-10-06: Version 1 신규 환자는 고정 P(region)가 반영된 Simulation-level choice probability로 병원을 선택한다.
+                self.arr_Person[idx_person].choice_prob = self.arr_population_choice_prob[idx_person].copy()
+            else:
+                self.arr_Person[idx_person].calculate_choice_prob()
             self.arr_Person[idx_person].choose_hospital()
             self.arr_population_CancerOrNot[idx_person] = True
             # 2026-09-28: dt부터 dt + cancer_duration - 1까지 active이며, 종료 timestep부터 expire_active_cancerpatients가 해제한다.
@@ -888,9 +1028,13 @@ class Simulation:
     def calculate_virtual_choice_prob(self):
         """Create the fixed pseudo-history used only before enough observed choices exist."""
         # 2026-09-21: PHQ/OHQ 없이 calibrated 초기 PRQ와 사람-지역 거리로 region choice probability를 계산
-        initial_PRQ = np.asarray(
-            list(self.parameter_set.dict_parameter_initial_PRQ.values()), dtype=float
+        # 2026-10-06: Version 1 VOR prehistory도 고정 calibrated PRQ와 같은 지역 attractiveness를 사용한다.
+        initial_PRQ_source = (
+            self.parameter_set.dict_parameter_fixed_PRQ
+            if self.parameter_set.quality_model_version == 'fixed_prq'
+            else self.parameter_set.dict_parameter_initial_PRQ
         )
+        initial_PRQ = np.asarray(list(initial_PRQ_source.values()), dtype=float)
         person_coords = np.array([[coord.x, coord.y] for coord in self.df_Person_info.coord.values])
         region_coords = np.array([
             [self.parameter_set.dict_crd_region[region].x, self.parameter_set.dict_crd_region[region].y]
@@ -899,7 +1043,7 @@ class Simulation:
         distance_effect_region = np.exp(-self.parameter_set.delta * np.sqrt(
             np.sum((person_coords[:, np.newaxis, :] - region_coords[np.newaxis, :, :]) ** 2, axis=2)
         ))
-        utility_region = initial_PRQ[np.newaxis, :] * self.parameter_set.beta_PQ + distance_effect_region * self.parameter_set.beta_d
+        utility_region = initial_PRQ[np.newaxis, :] * self._beta_PRQ() + distance_effect_region * self.parameter_set.beta_d
         exp_utility_region = np.exp(utility_region)
         choice_prob_region = exp_utility_region / np.sum(exp_utility_region, axis=1, keepdims=True)
 
@@ -932,7 +1076,8 @@ class Simulation:
         S_h = np.sum(history * weights[:, np.newaxis], axis=0)
         # 2026-09-21: VOR는 비누적 성분으로 매 timestep 재계산하며 Q_vmax=2, S_half=1/H를 적용
         Q_vmax = q_vmax
-        S_half = 1.0 / self.num_hospital
+        # S_half = 1.0 / self.num_hospital
+        S_half = self.parameter_set.S_half
         self.vor_OHQ = Q_vmax * S_h / (S_half + S_h)
 
     def investment_effect(self, hospital_action, dt):
@@ -950,10 +1095,12 @@ class Simulation:
 
     def update_total_OHQ(self):
         # 2026-10-01: 총 OHQ는 base, 비누적 VOR, 지연된 action 효과의 합으로 갱신
+        # 2026-10-06: 기존 기본 동작은 base, 비누적 VOR, 지연된 action 효과의 합으로 유지한다.
         self.df_Hospital_info["OQ_objective_quality"] = np.clip(
             self.base_OHQ + self.vor_OHQ + self.action_OHQ,
             self.min_quality,
-            self.max_quality,)
+            self.max_quality,
+        )
 
     # Information Provision
     def Information_Provision_Policy(self, dt):
@@ -968,7 +1115,7 @@ class Simulation:
                                                  replace=False)
 
         # Regional-level IPP
-        if self.parameter_set.prov_type == 1:
+        if self.parameter_set.prov_type == 1 and self.parameter_set.quality_model_version != 'fixed_prq':
             temp_PRQ = self.df_Hospital_info.groupby('idx_REGION')['OQ_objective_quality'].mean().values
             for idx_person in np.concatenate((idx_susceptible_info_prov, idx_patient_info_prov)):
                 self.arr_Person[idx_person].PRQ = np.random.normal(temp_PRQ, 
@@ -989,31 +1136,28 @@ class Simulation:
 
         # 2026-09-28: timestep 시작 시 종료자를 먼저 해제한 뒤, non-active 후보 중 신규 cancer patient를 지정한다.
         self.expire_active_cancerpatients(dt)
+        
+        # 2026-10-06: Version 1은 직전 PHQ에서 갱신된 RQ로 choice를 먼저 만들고, 그 확률로 신규 환자를 지정한다.
+        self.calculate_choice_prob_all()
         self.designate_new_cancerpatient(dt)
 
-        # Information provision
         if self.parameter_set.prov_type > 0:
             self.Information_Provision_Policy(dt)
-
             for idx_person in range(len(self.arr_Person)):
                 self.arr_population_PHQ[idx_person] = self.arr_Person[idx_person].PHQ
                 self.arr_population_PRQ[idx_person] = self.arr_Person[idx_person].PRQ
 
-        
-        self.update_WOM_all(dt)
-        
-        self.calculate_choice_prob_all()  # [2026-09-07 calculate choice probability]: person loop 없이 모든 choice probability를 한 번에 계산
-
-
-        # 2026-10-01: 실제 병원 선택량 기반 VOR effect + 병원 action에 따른 effect
-        # self.calculate_hospital_volume(dt)
+        # 2026-10-06: VOR OHQ를 먼저 확정한 뒤 hospital WOM/recognition으로 PHQ를 갱신한다.
         self.VOR_effect(self.parameter_set.Q_vmax, dt)
+        # fixed_prq/RQ 경로에서도 병원 action의 지연 효과를 반영한다.
         self.investment_effect(hospital_action, dt)
+        self.reinvestment_OHQ[:] = self.action_OHQ
         self.update_total_OHQ()
-        # self.scale_effect(dt) # 추후 hospital action에 따른 scale effect 
-
+        self.update_WOM_all(dt)
+        # 2026-10-06: PHQ 갱신 뒤 RQ를 누적 갱신하며, 이 RQ는 다음 timestep choice에 반영된다.
+        self.update_RQ_from_PHQ()
         self.update_Archive(dt)
-
+        return
 
 
 class City:
