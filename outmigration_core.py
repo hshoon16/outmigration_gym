@@ -938,15 +938,22 @@ class Simulation:
         if self.parameter_set.quality_model_version == 'phq_driven_prq':
             # 2026-10-06: PRQ는 noise를 포함한 모든 timestep update를 건너뛰고 초기 calibrated 값 그대로 유지한다.
             new_PRQ = self.arr_population_PRQ.copy()
+            # 2026-10-28: WOM update에도 PRQ 다시 적용
+            new_PRQ = np.clip(
+                # self.arr_population_PRQ + C_r + S_r + N_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
+                self.arr_population_PRQ + C_r + S_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
+                self.min_quality, self.max_quality
+            )
         else:
             new_PRQ = np.clip(
                 # self.arr_population_PRQ + C_r + S_r + N_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
                 self.arr_population_PRQ + C_r + S_r + E_r + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PRQ.shape),
                 self.min_quality, self.max_quality
             )
-        if self.parameter_set.quality_model_version == 'phq_driven_prq' and self.parameter_set.validate_phq_driven_prq:
-            if not np.array_equal(new_PRQ, self.arr_population_PRQ):
-                raise AssertionError("PHQ-driven PRQ changed outside update_PRQ_from_PHQ().")
+        # 2026-10-28 : PRQ update가 이제 wom에서도 일어남
+        # if self.parameter_set.quality_model_version == 'phq_driven_prq' and self.parameter_set.validate_phq_driven_prq:
+        #     if not np.array_equal(new_PRQ, self.arr_population_PRQ):
+        #         raise AssertionError("PHQ-driven PRQ changed outside update_PRQ_from_PHQ().")
         # 2026-10-08: PRQ update가 지역별 평균이 아닌 실제 hospital PHQ 변화량 합을 사용하도록 보관한다.
         self.last_delta_PHQ = new_PHQ - previous_PHQ
         self.arr_population_PHQ[:], self.arr_population_PRQ[:] = new_PHQ, new_PRQ
