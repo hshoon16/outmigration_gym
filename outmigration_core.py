@@ -928,8 +928,9 @@ class Simulation:
         C_h, S_h = self.calculate_C_h(), self.calculate_S_h()
         if self.parameter_set.quality_model_version == 'phq_driven_prq':
             # 2026-10-06: Version 1은 regional WOM과 regional recognition을 계산·반영하지 않는다.
-            C_r = np.zeros((self.num_population, self.num_region))
-            S_r = np.zeros((self.num_population, self.num_region))
+            # C_r = np.zeros((self.num_population, self.num_region))
+            # S_r = np.zeros((self.num_population, self.num_region))
+            C_r, S_r = self.calculate_C_r(), self.calculate_S_r()
         else:
             # C_r, S_r, N_r = self.calculate_C_r(), self.calculate_S_r(), self.calculate_N_r_all()
             C_r, S_r = self.calculate_C_r(), self.calculate_S_r()
