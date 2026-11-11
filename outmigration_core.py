@@ -1,4 +1,4 @@
-"""OHQ-only hospital-choice ABM core.
+﻿"""OHQ-only hospital-choice ABM core.
 
 Direct all-hospital choice depends only on objective hospital quality (OHQ)
 and person-to-hospital distance. Realized cancer choices are outputs only.
@@ -60,7 +60,7 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
                             "GW": Point(128.8961, 37.7644)},
         "max_quality": 5.0, "min_quality": 0.0,
         # 2026-11-11: beta_OHQ starts at 10.62; OHQ-scale recalibration is still required.
-        "beta_OHQ": 10.62, "beta_d": 20.30, "delta": 1.85,
+        "beta_OHQ": 10.62, "beta_d": 20.30, "delta": 1.85, # beta_d : 20.30
         "vor_K": 5, "gamma_alpha": 2.0, "gamma_beta": 2.0,
         "Q_vmax": 2.0, "S_half": 1 / 47,
         "action_effect_K": 5, "action_inv_gamma_alpha": 3.0,
