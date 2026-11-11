@@ -217,7 +217,7 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
 
         # 2026-10-01: 병원 투자 action의 지연된 품질개선 효과 parameters
         # 현재 action을 포함한 최근 action_effect_K개 timestep을 inverse-gamma 가중합한다.
-        'action_effect_K': 5,
+        'action_effect_K': 10,
         'action_inv_gamma_alpha': 3.0,
         'action_inv_gamma_beta': 8.0,
         'Q_amax': 2.0,
@@ -265,8 +265,10 @@ class Simulation:
         self.arr_population_initial_PRQ = None
         self.arr_population_choice_prob_region_by_region = None
         self.last_PRQ_delta = None
-        # 2026-10-08: PHQ-driven PRQ update에 사용할 직전 hospital-level PHQ 변화량이다.
+        # 2026-10-08: 실제 관측된 hospital-level PHQ 변화량이다.
         self.last_delta_PHQ = None
+        # 2026-10-28: PRQ에는 sigma_wom noise를 제외한 hospital PHQ 변화량만 전달한다.
+        self.last_delta_PHQ_for_PRQ = None
         # 2026-10-02: 신규 cancer patient의 1회성 recognition 대상을 Simulation-level Boolean 배열로 관리한다.
         self.arr_population_is_new_cancerpatient = np.full(self.num_population, False)
         # 2026-09-28: 사람별 active cancer 종료 timestep; -1은 현재 non-cancer 상태를 뜻한다.
@@ -279,11 +281,18 @@ class Simulation:
         # VOR Gamma weights
         lags = np.arange(1, self.parameter_set.vor_K + 1)
 
-        self.vor_weights = gamma.pdf(
-            lags,
-            a=self.parameter_set.gamma_alpha,
-            scale=self.parameter_set.gamma_beta
-        )
+        # self.vor_weights = gamma.pdf(
+        #     lags,
+        #     a=self.parameter_set.gamma_alpha,
+        #     scale=self.parameter_set.gamma_beta
+        # )
+
+        # 2026-11-09: VOR weights를 inverse-gamma로 변경
+        self.vor_weights = invgamma.pdf(
+                    lags,
+                    a=self.parameter_set.action_inv_gamma_alpha,
+                    scale=self.parameter_set.action_inv_gamma_beta
+                )
 
         # 2026-10-01: timestep별 병원 투자 action과 그에 따른 품질개선 효과
         self.arr_hospital_action = np.zeros(
@@ -662,9 +671,9 @@ class Simulation:
         """Update mutable PRQ from the sum of changed hospital PHQ values by region."""
         if self.parameter_set.quality_model_version != 'phq_driven_prq':
             return
-        # 2026-10-08: PRQ의 유일한 update 경로는 해당 지역에서 실제 update된 병원의 delta PHQ 합이다.
-        if self.last_delta_PHQ is None:
-            raise RuntimeError("PHQ delta is required before updating PHQ-driven PRQ.")
+        # 2026-10-28: PRQ의 PHQ 경로는 sigma_wom noise를 제외한 병원별 변화량 합만 사용한다.
+        if self.last_delta_PHQ_for_PRQ is None:
+            raise RuntimeError("Noise-free PHQ delta is required before updating PHQ-driven PRQ.")
         previous_PRQ = self.arr_population_PRQ.copy()
         delta_PHQ_by_region = np.zeros((self.num_population, self.num_region))
         for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
@@ -673,7 +682,7 @@ class Simulation:
                 raise ValueError(
                     f"Cannot update PHQ-driven PRQ: region index {idx_region} has no hospitals."
                 )
-            regional_delta_PHQ = self.last_delta_PHQ[:, idx_hospitals]
+            regional_delta_PHQ = self.last_delta_PHQ_for_PRQ[:, idx_hospitals]
             updated_hospitals = regional_delta_PHQ != 0.0
             # No denominator: sum only hospitals whose PHQ changed in this timestep.
             delta_PHQ_by_region[:, idx_region] = np.where(
@@ -696,7 +705,7 @@ class Simulation:
                 raise AssertionError("Calibrated initial PRQ baseline changed during the episode.")
             if not np.allclose(self.arr_population_PRQ, previous_PRQ + self.last_PRQ_delta):
                 raise AssertionError("PHQ-driven PRQ update does not match the regional delta-PHQ-sum formula.")
-            if np.array_equal(self.last_delta_PHQ, 0.0) and not np.array_equal(
+            if np.array_equal(self.last_delta_PHQ_for_PRQ, 0.0) and not np.array_equal(
                 self.arr_population_PRQ, previous_PRQ
             ):
                 raise AssertionError("PRQ changed although no hospital PHQ changed.")
@@ -931,8 +940,14 @@ class Simulation:
         # 2026-10-06: Version 1 PHQ는 초기화와 동일하게 [0, 3] 범위로 제한한다.
         PHQ_upper_bound = 3.0 if self.parameter_set.quality_model_version == 'phq_driven_prq' else self.max_quality
         previous_PHQ = self.arr_population_PHQ.copy()
+        phq_update_without_wom_noise = previous_PHQ + C_h + S_h + E_h
+        # 2026-10-28: PRQ 전달용 변화량은 sigma_wom을 더하기 전 WOM/recognition 결과만 사용한다.
+        self.last_delta_PHQ_for_PRQ = (
+            np.clip(phq_update_without_wom_noise, self.min_quality, PHQ_upper_bound)
+            - previous_PHQ
+        )
         new_PHQ = np.clip(
-            self.arr_population_PHQ + C_h + S_h + E_h + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PHQ.shape),
+            phq_update_without_wom_noise + np.random.normal(0, self.parameter_set.sigma_wom, self.arr_population_PHQ.shape),
             self.min_quality, PHQ_upper_bound
         )
         if self.parameter_set.quality_model_version == 'phq_driven_prq':
