@@ -35,10 +35,10 @@ def random_points_in_multipolygon(shape, num_points):
 def load_geographic_context(data_dir=".", geography_dir="."):
     global gdf, outside_polygon_mask
     gdf = gpd.read_file(Path(geography_dir) / "Korea_shapefiles/TL_SCCO_CTPRVN.shp", encoding="euc-kr")
-    # 2026-11-11: preserve the legacy explicit province-name decoding used by the city input workbook.
+    # 2026-11-12: align shapefile row order with the legacy city names so person locations use the correct province polygon.
     gdf["CTP_KOR_NM"] = [
-        "서울", "경기", "경남", "경북", "광주", "대구", "대전", "부산", "세종",
-        "울산", "인천", "제주", "전남", "전북", "충남", "충북", "강원",
+        "강원", "경기", "경남", "경북", "광주", "대구", "대전", "부산", "서울",
+        "세종", "울산", "인천", "전남", "전북", "제주", "충남", "충북",
     ]
     outside_polygon_mask = np.load(Path(data_dir) / "outside_polygon_mask.npy")
 
