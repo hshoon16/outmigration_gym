@@ -59,8 +59,11 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
                             "HN": Point(126.8515, 35.1603), "CC": Point(127.4347, 36.3324),
                             "GW": Point(128.8961, 37.7644)},
         "max_quality": 5.0, "min_quality": 0.0,
+        # 2026-11-12: fixed calibrated regional attractiveness for the two-stage choice model.
+        "dict_parameter_initial_PRQ": {"SM": 2.90, "YN": 2.56, "HN": 2.31, "CC": 2.07, "GW": 2.31},
+        "beta_PRQ": 10.62,
         # 2026-11-11: beta_OHQ starts at 10.62; OHQ-scale recalibration is still required.
-        "beta_OHQ": 10.62, "beta_d": 20.30, "delta": 1.85, # beta_d : 20.30
+        "beta_OHQ": 10.62, "beta_d": 20.30, "delta": 1.85,
         "vor_K": 5, "gamma_alpha": 2.0, "gamma_beta": 2.0,
         "Q_vmax": 2.0, "S_half": 1 / 47,
         "action_effect_K": 5, "action_inv_gamma_alpha": 3.0,
@@ -77,6 +80,10 @@ class Simulation:
         self.num_hospital = int(self.df_city_info.NUM_HOSPITAL.sum())
         self.min_quality, self.max_quality = float(parameter_set.min_quality), float(parameter_set.max_quality)
         self.arr_population_choice_prob = np.zeros((self.num_population, self.num_hospital))
+        self.region_labels = list(parameter_set.dict_parameter_initial_PRQ.keys())
+        self.num_region = len(self.region_labels)
+        self.fixed_PRQ_by_region = np.asarray(list(parameter_set.dict_parameter_initial_PRQ.values()), dtype=float)
+        self.arr_population_choice_prob_region_by_region = np.zeros((self.num_population, self.num_region))
         self.arr_population_CancerOrNot = np.zeros(self.num_population, dtype=bool)
         self.arr_population_is_new_cancerpatient = np.zeros(self.num_population, dtype=bool)
         self.arr_active_cancer_end_dt = np.full(self.num_population, -1, dtype=int)
@@ -140,6 +147,15 @@ class Simulation:
         if len(self.df_Hospital_info) != self.num_hospital:
             raise ValueError("Hospital input does not match NUM_HOSPITAL totals.")
         self.df_Hospital_info["OQ_objective_quality"] = self.min_quality
+        # 2026-11-12: store region-to-hospital indices for the fixed-PRQ two-stage choice only.
+        region_to_index = {region: idx for idx, region in enumerate(self.region_labels)}
+        self.arr_hospital_region = self.df_Hospital_info["REGION"].map(region_to_index).to_numpy(dtype=int)
+        self.idx_hospital_in_region = [
+            np.flatnonzero(self.arr_hospital_region == idx_region)
+            for idx_region in range(self.num_region)
+        ]
+        if any(len(indices) == 0 for indices in self.idx_hospital_in_region):
+            raise ValueError("Every fixed-PRQ destination region must contain at least one hospital.")
         self.arr_Hospital = np.array([Hospital(r) for r in records], dtype=object)
 
     def create_People(self):
@@ -163,6 +179,12 @@ class Simulation:
         hospital_xy = np.array([(p.x, p.y) for p in self.df_Hospital_info.coord])
         distance = np.sqrt(((person_xy[:, None, :] - hospital_xy[None, :, :]) ** 2).sum(axis=2))
         self.arr_distance_effect_hospital = np.exp(-self.parameter_set.delta * distance)
+        region_xy = np.array([
+            (self.parameter_set.dict_crd_region[region].x, self.parameter_set.dict_crd_region[region].y)
+            for region in self.region_labels
+        ])
+        region_distance = np.sqrt(((person_xy[:, None, :] - region_xy[None, :, :]) ** 2).sum(axis=2))
+        self.arr_distance_effect_region = np.exp(-self.parameter_set.delta * region_distance)
 
     @staticmethod
     def _softmax(utility):
@@ -171,23 +193,50 @@ class Simulation:
         return exp_utility / exp_utility.sum(axis=1, keepdims=True)
 
     def calculate_virtual_choice_prob(self):
-        """OHQ-only virtual probabilities fill missing VOR lags before observed history exists."""
-        utility = (self.base_OHQ[None, :] * self.parameter_set.beta_OHQ +
-                   self.arr_distance_effect_hospital * self.parameter_set.beta_d)
-        self.virtual_choice_prob = self._softmax(utility).mean(axis=0)
+        """Build two-stage fixed-PRQ virtual probabilities for missing VOR lags."""
+        utility_region = (
+            self.fixed_PRQ_by_region[None, :] * self.parameter_set.beta_PRQ
+            + self.arr_distance_effect_region * self.parameter_set.beta_d
+        )
+        virtual_choice_prob_region = self._softmax(utility_region)
+        virtual_choice_prob = np.zeros((self.num_population, self.num_hospital))
+        for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
+            utility_hospital = (
+                self.base_OHQ[idx_hospitals][None, :] * self.parameter_set.beta_OHQ
+                + self.arr_distance_effect_hospital[:, idx_hospitals] * self.parameter_set.beta_d
+            )
+            virtual_choice_prob[:, idx_hospitals] = (
+                virtual_choice_prob_region[:, idx_region, None] * self._softmax(utility_hospital)
+            )
+        self.virtual_choice_prob = virtual_choice_prob.mean(axis=0)
         self.prehistory_choice_prob = np.repeat(self.virtual_choice_prob[None, :], int(self.parameter_set.vor_K), axis=0)
 
     def calculate_choice_prob_all(self):
-        """Compute direct all-hospital choice probabilities from current OHQ and distance effects."""
+        """Compute fixed-PRQ regional and OHQ within-region hospital probabilities."""
         ohq = self.df_Hospital_info.OQ_objective_quality.to_numpy(dtype=float)
-        utility = ohq[None, :] * self.parameter_set.beta_OHQ + self.arr_distance_effect_hospital * self.parameter_set.beta_d
-        self.arr_population_choice_prob[:] = self._softmax(utility)
+        utility_region = (
+            self.fixed_PRQ_by_region[None, :] * self.parameter_set.beta_PRQ
+            + self.arr_distance_effect_region * self.parameter_set.beta_d
+        )
+        choice_prob_region = self._softmax(utility_region)
+        final_choice_prob = np.zeros((self.num_population, self.num_hospital))
+        for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
+            utility_hospital = (
+                ohq[idx_hospitals][None, :] * self.parameter_set.beta_OHQ
+                + self.arr_distance_effect_hospital[:, idx_hospitals] * self.parameter_set.beta_d
+            )
+            final_choice_prob[:, idx_hospitals] = (
+                choice_prob_region[:, idx_region, None] * self._softmax(utility_hospital)
+            )
+        self.arr_population_choice_prob_region_by_region[:] = choice_prob_region
+        self.arr_population_choice_prob[:] = final_choice_prob
         for person in self.arr_Person:
             person.choice_prob = self.arr_population_choice_prob[person.idx_person].copy()
 
     def create_Archive(self):
         t, p, h = int(self.parameter_set.max_dt), self.num_population, self.num_hospital
         self.achv_population_choice_prob = np.zeros((t, p, h))
+        self.achv_population_choice_prob_region = np.zeros((t, p, self.num_region))
         self.achv_mean_hospital_choice_prob = np.zeros((t, h))
         self.achv_OHQ = np.zeros((t, h))
         self.achv_base_OHQ = np.zeros((t, h))
@@ -198,6 +247,7 @@ class Simulation:
 
     def update_Archive(self, dt):
         self.achv_population_choice_prob[dt] = self.arr_population_choice_prob
+        self.achv_population_choice_prob_region[dt] = self.arr_population_choice_prob_region_by_region
         self.achv_mean_hospital_choice_prob[dt] = self.arr_population_choice_prob.mean(axis=0)
         self.achv_OHQ[dt] = self.df_Hospital_info.OQ_objective_quality.to_numpy()
         self.achv_base_OHQ[dt], self.achv_vor_OHQ[dt], self.achv_action_OHQ[dt] = self.base_OHQ, self.vor_OHQ, self.action_OHQ
