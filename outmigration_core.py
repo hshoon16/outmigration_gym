@@ -59,14 +59,18 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
                             "HN": Point(126.8515, 35.1603), "CC": Point(127.4347, 36.3324),
                             "GW": Point(128.8961, 37.7644)},
         "max_quality": 5.0, "min_quality": 0.0,
+        # 2026-11-16: label the current direct all-hospital OHQ choice implementation for future result comparison.
+        "patient_choice_model": "no_prq",
         # 2026-11-12: fixed calibrated regional attractiveness for the two-stage choice model.
         "dict_parameter_initial_PRQ": {"SM": 2.90, "YN": 2.56, "HN": 2.31, "CC": 2.07, "GW": 2.31},
         "beta_PRQ": 10.62,
         # 2026-11-11: beta_OHQ starts at 10.62; OHQ-scale recalibration is still required.
         "beta_OHQ": 10.62, "beta_d": 20.30, "delta": 1.85,
+        # 2026-11-16: strength of the with_prq model's regional response to OHQ inclusive-value change.
+        "eta_IV": 0.75,
         "vor_K": 5, "gamma_alpha": 2.0, "gamma_beta": 2.0,
         "Q_vmax": 2.0, "S_half": 1 / 47,
-        "action_effect_K": 5, "action_inv_gamma_alpha": 3.0,
+        "action_effect_K": 10, "action_inv_gamma_alpha": 3.0,
         "action_inv_gamma_beta": 8.0, "Q_amax": 2.0,
     })
 
@@ -75,6 +79,13 @@ class Simulation:
     """OHQ-only simulation with VOR and delayed action-quality effects."""
     def __init__(self, parameter_set):
         self.parameter_set = parameter_set
+        # 2026-11-16: actual choice supports direct OHQ (no_prq) and fixed-PRQ inclusive-value paths.
+        if parameter_set.patient_choice_model not in {"no_prq", "with_prq"}:
+            raise ValueError(
+                f"Unsupported patient_choice_model: {parameter_set.patient_choice_model}. "
+                "Currently supported: 'no_prq', 'with_prq'."
+            )
+        self.run_metadata = {"patient_choice_model": parameter_set.patient_choice_model}
         self.df_city_info, self.df_hospital_crd = parameter_set.df_city_info, parameter_set.df_hospital_crd
         self.num_population = int(self.df_city_info[parameter_set.target_population_column].sum())
         self.num_hospital = int(self.df_city_info.NUM_HOSPITAL.sum())
@@ -84,6 +95,7 @@ class Simulation:
         self.num_region = len(self.region_labels)
         self.fixed_PRQ_by_region = np.asarray(list(parameter_set.dict_parameter_initial_PRQ.values()), dtype=float)
         self.arr_population_choice_prob_region_by_region = np.zeros((self.num_population, self.num_region))
+        self.arr_population_baseline_inclusive_value = None
         self.arr_population_CancerOrNot = np.zeros(self.num_population, dtype=bool)
         self.arr_population_is_new_cancerpatient = np.zeros(self.num_population, dtype=bool)
         self.arr_active_cancer_end_dt = np.full(self.num_population, -1, dtype=int)
@@ -94,7 +106,7 @@ class Simulation:
         self.action_OHQ = np.zeros(self.num_hospital, dtype=float)
         self.idx_new_patient = np.empty(0, dtype=int)
         lags = np.arange(1, int(parameter_set.vor_K) + 1, dtype=float)
-        self.vor_weights = gamma.pdf(lags, a=parameter_set.gamma_alpha, scale=parameter_set.gamma_beta)
+        self.vor_weights = invgamma.pdf(lags, a=parameter_set.gamma_alpha, scale=parameter_set.gamma_beta)
         action_lags = np.arange(1, int(parameter_set.action_effect_K) + 1, dtype=float)
         self.action_effect_weights = invgamma.pdf(action_lags, a=parameter_set.action_inv_gamma_alpha,
                                                   scale=parameter_set.action_inv_gamma_beta)
@@ -114,6 +126,11 @@ class Simulation:
 
     def prepare_episode(self):
         self.set_OHQ()
+        if self.parameter_set.patient_choice_model == "with_prq":
+            # 2026-11-16: freeze inclusive-value baseline after initial VOR has formed t=0 total OHQ.
+            self.arr_population_baseline_inclusive_value = self._calculate_inclusive_value(
+                self._calculate_hospital_utility()
+            )
         self.calculate_choice_prob_all()
         self.create_Archive()
 
@@ -147,7 +164,7 @@ class Simulation:
         if len(self.df_Hospital_info) != self.num_hospital:
             raise ValueError("Hospital input does not match NUM_HOSPITAL totals.")
         self.df_Hospital_info["OQ_objective_quality"] = self.min_quality
-        # 2026-11-12: store region-to-hospital indices for the fixed-PRQ two-stage choice only.
+        # 2026-11-16: retain region-to-hospital indices only for calibrated-PRQ virtual VOR history.
         region_to_index = {region: idx for idx, region in enumerate(self.region_labels)}
         self.arr_hospital_region = self.df_Hospital_info["REGION"].map(region_to_index).to_numpy(dtype=int)
         self.idx_hospital_in_region = [
@@ -192,46 +209,83 @@ class Simulation:
         exp_utility = np.exp(shifted)
         return exp_utility / exp_utility.sum(axis=1, keepdims=True)
 
-    def calculate_virtual_choice_prob(self):
-        """Build two-stage fixed-PRQ virtual probabilities for missing VOR lags."""
-        utility_region = (
-            self.fixed_PRQ_by_region[None, :] * self.parameter_set.beta_PRQ
-            + self.arr_distance_effect_region * self.parameter_set.beta_d
+    def _calculate_hospital_utility(self):
+        """Return current OHQ-plus-distance utility for every person-hospital pair."""
+        ohq = self.df_Hospital_info.OQ_objective_quality.to_numpy(dtype=float)
+        return (
+            ohq[None, :] * self.parameter_set.beta_OHQ
+            + self.arr_distance_effect_hospital * self.parameter_set.beta_d
         )
-        virtual_choice_prob_region = self._softmax(utility_region)
-        virtual_choice_prob = np.zeros((self.num_population, self.num_hospital))
+
+    def _calculate_inclusive_value(self, hospital_utility):
+        """Compute stable person-region log-sum-exp values from regional hospital subsets."""
+        inclusive_value = np.empty((self.num_population, self.num_region), dtype=float)
         for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
-            utility_hospital = (
-                self.base_OHQ[idx_hospitals][None, :] * self.parameter_set.beta_OHQ
-                + self.arr_distance_effect_hospital[:, idx_hospitals] * self.parameter_set.beta_d
+            regional_utility = hospital_utility[:, idx_hospitals]
+            maximum = regional_utility.max(axis=1, keepdims=True)
+            inclusive_value[:, idx_region] = (
+                maximum[:, 0] + np.log(np.exp(regional_utility - maximum).sum(axis=1))
             )
-            virtual_choice_prob[:, idx_hospitals] = (
-                virtual_choice_prob_region[:, idx_region, None] * self._softmax(utility_hospital)
+        return inclusive_value
+
+    def calculate_virtual_choice_prob(self):
+        """Build calibrated-PRQ two-stage virtual probabilities for missing VOR lags."""
+        if self.parameter_set.patient_choice_model in {"no_prq", "with_prq"}:
+            utility_region = (
+                self.fixed_PRQ_by_region[None, :] * self.parameter_set.beta_PRQ
+                + self.arr_distance_effect_region * self.parameter_set.beta_d
             )
-        self.virtual_choice_prob = virtual_choice_prob.mean(axis=0)
-        self.prehistory_choice_prob = np.repeat(self.virtual_choice_prob[None, :], int(self.parameter_set.vor_K), axis=0)
+            virtual_choice_prob_region = self._softmax(utility_region)
+            virtual_choice_prob = np.zeros((self.num_population, self.num_hospital))
+            for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
+                utility_hospital = (
+                    self.arr_distance_effect_hospital[:, idx_hospitals] * self.parameter_set.beta_d
+                )
+                virtual_choice_prob[:, idx_hospitals] = (
+                    virtual_choice_prob_region[:, idx_region, None] * self._softmax(utility_hospital)
+                )
+            self.virtual_choice_prob = virtual_choice_prob.mean(axis=0)
+            self.prehistory_choice_prob = np.repeat(
+                self.virtual_choice_prob[None, :], int(self.parameter_set.vor_K), axis=0
+            )
+            return
+        raise ValueError(
+            f"Unsupported patient_choice_model: {self.parameter_set.patient_choice_model}. "
+            "Currently supported: 'no_prq', 'with_prq'."
+        )
 
     def calculate_choice_prob_all(self):
-        """Compute fixed-PRQ regional and OHQ within-region hospital probabilities."""
-        ohq = self.df_Hospital_info.OQ_objective_quality.to_numpy(dtype=float)
-        utility_region = (
-            self.fixed_PRQ_by_region[None, :] * self.parameter_set.beta_PRQ
-            + self.arr_distance_effect_region * self.parameter_set.beta_d
-        )
-        choice_prob_region = self._softmax(utility_region)
-        final_choice_prob = np.zeros((self.num_population, self.num_hospital))
-        for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
-            utility_hospital = (
-                ohq[idx_hospitals][None, :] * self.parameter_set.beta_OHQ
-                + self.arr_distance_effect_hospital[:, idx_hospitals] * self.parameter_set.beta_d
+        """Compute final actual hospital probabilities for the configured patient-choice model."""
+        if self.parameter_set.patient_choice_model == "no_prq":
+            self.arr_population_choice_prob[:] = self._softmax(self._calculate_hospital_utility())
+        elif self.parameter_set.patient_choice_model == "with_prq":
+            hospital_utility = self._calculate_hospital_utility()
+            current_inclusive_value = self._calculate_inclusive_value(hospital_utility)
+            delta_inclusive_value = (
+                current_inclusive_value - self.arr_population_baseline_inclusive_value
             )
-            final_choice_prob[:, idx_hospitals] = (
-                choice_prob_region[:, idx_region, None] * self._softmax(utility_hospital)
+            region_utility = (
+                self.fixed_PRQ_by_region[None, :] * self.parameter_set.beta_PRQ
+                + self.arr_distance_effect_region * self.parameter_set.beta_d
+                + self.parameter_set.eta_IV * delta_inclusive_value
             )
-        self.arr_population_choice_prob_region_by_region[:] = choice_prob_region
-        self.arr_population_choice_prob[:] = final_choice_prob
+            self.arr_population_choice_prob_region_by_region[:] = self._softmax(region_utility)
+            final_choice_prob = np.zeros((self.num_population, self.num_hospital))
+            for idx_region, idx_hospitals in enumerate(self.idx_hospital_in_region):
+                conditional_prob = self._softmax(hospital_utility[:, idx_hospitals])
+                final_choice_prob[:, idx_hospitals] = (
+                    self.arr_population_choice_prob_region_by_region[:, idx_region, None]
+                    * conditional_prob
+                )
+            self.arr_population_choice_prob[:] = final_choice_prob
+        else:
+            raise ValueError(
+                f"Unsupported patient_choice_model: {self.parameter_set.patient_choice_model}. "
+                "Currently supported: 'no_prq', 'with_prq'."
+            )
         for person in self.arr_Person:
             person.choice_prob = self.arr_population_choice_prob[person.idx_person].copy()
+        return
 
     def create_Archive(self):
         t, p, h = int(self.parameter_set.max_dt), self.num_population, self.num_hospital
