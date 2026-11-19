@@ -236,9 +236,9 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
         'n_c': 50,
         'sigma_wom': 0.01,
         'mu_hc': 0.32, # test
-        'lambda_c': 1.5,
+        'lambda_c': 15, # test
         'mu_hs': 0.2,
-        'lambda_s': 1.5,
+        'lambda_s': 15, # test
         'mu_rc': 0.32, # test
         'mu_rs': 0.1,
         'mu_rn': 0.1,
