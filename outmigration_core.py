@@ -67,7 +67,7 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
         # 2026-11-11: beta_OHQ starts at 10.62; OHQ-scale recalibration is still required.
         "beta_OHQ": 10.62, "beta_d": 20.30, "delta": 1.85,
         # 2026-11-16: strength of the with_prq model's regional response to OHQ inclusive-value change.
-        "eta_IV": 1.0,
+        "eta_IV": 0.7,
         "vor_K": 5, "gamma_alpha": 2.0, "gamma_beta": 2.0,
         "Q_vmax": 2.0, "S_half": 1 / 47,
         "action_effect_K": 10, "action_inv_gamma_alpha": 3.0,
