@@ -939,7 +939,7 @@ class Simulation:
         E_h, E_r = self.calculate_recognition_all(dt)
 
         # 2026-10-06: Version 1 PHQ는 초기화와 동일하게 [0, 3] 범위로 제한한다.
-        PHQ_upper_bound = 3.0 if self.parameter_set.quality_model_version == 'phq_driven_prq' else self.max_quality
+        PHQ_upper_bound = self.max_quality
         previous_PHQ = self.arr_population_PHQ.copy()
         phq_update_without_wom_noise = previous_PHQ + C_h + S_h + E_h
         # 2026-10-28: PRQ 전달용 변화량은 sigma_wom을 더하기 전 WOM/recognition 결과만 사용한다.
