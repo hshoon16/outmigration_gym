@@ -585,7 +585,7 @@ class Simulation:
             self.df_Hospital_info.OQ_objective_quality.values[np.newaxis, :] + np.random.normal(
                 0, self.parameter_set.sigma_PHQ, (self.num_population, self.num_hospital)
             ),
-            0.0, 3.0
+            0.0, 5.0
         )
         if self.parameter_set.quality_model_version == 'phq_driven_prq':
             # 2026-10-08: calibrated PRQ는 immutable baseline으로 보관하고, choice용 PRQ는 별도 mutable copy로 둔다.
@@ -603,7 +603,7 @@ class Simulation:
                 initial_PRQ[np.newaxis, :] + np.random.normal(
                     0, self.parameter_set.sigma_PRQ, (self.num_population, self.num_region)
                 ),
-                0.0, 3.0
+                0.0, 5.0
             )
 
         # 2026-09-11: Shapely Point.distance와 동일한 평면 좌표 거리식을 broadcasting으로 계산
@@ -1192,7 +1192,7 @@ class Simulation:
         # Hospital-level IPP
         if self.parameter_set.prov_type == 2:
             for idx_person in np.concatenate((idx_susceptible_info_prov, idx_patient_info_prov)):
-                self.arr_Person[idx_person].PHQ = np.random.normal(self.achv_OHQ[dt-1], 
+                self.arr_Person[idx_person].PHQ = np.random.normal(self.achv_OHQ[dt], 
                                                     self.parameter_set.sigma_ip, 
                                                     len(self.df_Hospital_info))
 
@@ -1204,15 +1204,7 @@ class Simulation:
         # 2026-09-28: timestep 시작 시 종료자를 먼저 해제한 뒤, non-active 후보 중 신규 cancer patient를 지정한다.
         self.expire_active_cancerpatients(dt)
         
-        # 2026-10-08: PHQ-driven PRQ mode는 직전 PHQ update로 갱신된 PRQ로 choice를 만든 뒤 신규 환자를 지정한다.
-        self.calculate_choice_prob_all()
         self.designate_new_cancerpatient(dt)
-
-        if self.parameter_set.prov_type > 0:
-            self.Information_Provision_Policy(dt)
-            for idx_person in range(len(self.arr_Person)):
-                self.arr_population_PHQ[idx_person] = self.arr_Person[idx_person].PHQ
-                self.arr_population_PRQ[idx_person] = self.arr_Person[idx_person].PRQ
 
         # 2026-10-06: VOR OHQ를 먼저 확정한 뒤 hospital WOM/recognition으로 PHQ를 갱신한다.
         self.VOR_effect(self.parameter_set.Q_vmax, dt)
@@ -1221,8 +1213,18 @@ class Simulation:
         self.reinvestment_OHQ[:] = self.action_OHQ
         self.update_total_OHQ()
         self.update_WOM_all(dt)
+
+        if self.parameter_set.prov_type > 0:
+            self.Information_Provision_Policy(dt)
+            for idx_person in range(len(self.arr_Person)):
+                self.arr_population_PHQ[idx_person] = self.arr_Person[idx_person].PHQ
+                self.arr_population_PRQ[idx_person] = self.arr_Person[idx_person].PRQ
+                    
         # 2026-10-08: PHQ 갱신 뒤 PRQ를 누적 갱신하며, 이 PRQ는 다음 timestep choice에 반영된다.
         self.update_PRQ_from_PHQ(dt)
+
+        # 2026-10-08: PHQ-driven PRQ mode는 직전 PHQ update로 갱신된 PRQ로 choice를 만든 뒤 신규 환자를 지정한다.
+        self.calculate_choice_prob_all()
         self.update_Archive(dt)
         return
 
