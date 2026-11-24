@@ -243,9 +243,12 @@ def make_default_parameter_set(df_city_info, df_hospital_crd):
         'mu_rs': 0.1,
         'mu_rn': 0.1,
         'wom_update_mode': 'synchronous_vectorized',
-        'gamma_c': 0.3,
-        'gamma_s': 0.01,
+        'gamma_c': 1.0,
+        'gamma_s': 1.0,
         'sigma_ip': 0.05,
+        # 2026-11-24: hospital IPP accuracy and update frequency; coverage remains controlled independently by gamma_c/gamma_s.
+        'alpha_ipp': 0.5,
+        'ipp_interval': 10,
         'prov_type': 0})
     
 class Simulation:
@@ -979,7 +982,9 @@ class Simulation:
             # person.C_r[dt], person.S_r[dt], person.N_r[dt], person.E_r[dt] = C_r[idx_person], S_r[idx_person], N_r[idx_person], E_r[idx_person]
             person.C_r[dt], person.S_r[dt], person.E_r[dt] = C_r[idx_person], S_r[idx_person], E_r[idx_person]
             person.Q_h[dt], person.Q_r[dt] = new_PHQ[idx_person], new_PRQ[idx_person]
-            person.PHQ, person.PRQ = new_PHQ[idx_person], new_PRQ[idx_person]
+            # 2026-11-24: retain shared row views so later vectorized IPP updates stay visible through Person.PHQ/PRQ.
+            person.PHQ = self.arr_population_PHQ[idx_person]
+            person.PRQ = self.arr_population_PRQ[idx_person]
 
 
     def set_base_PHQ(self):
@@ -1171,30 +1176,68 @@ class Simulation:
 
     # Information Provision
     def Information_Provision_Policy(self, dt):
-        idx_susceptible = np.array(list(set(self.df_Person_info['idx_person'].values) - set(self.idx_new_patient)))
-        idx_susceptible_info_prov = np.random.choice(idx_susceptible, 
-                                                     size=int(np.round(len(idx_susceptible) * 
-                                                                       self.parameter_set.gamma_s)), 
-                                                                       replace=False)
-        idx_patient_info_prov = np.random.choice(self.idx_new_patient,
-                                                 size=int(np.round(len(self.idx_new_patient) * 
-                                                                   self.parameter_set.gamma_c)),
-                                                 replace=False)
+        if self.parameter_set.prov_type == 0:
+            return
+
+        if self.parameter_set.prov_type == 2:
+            try:
+                alpha = float(self.parameter_set.alpha_ipp)
+            except (TypeError, ValueError) as error:
+                raise ValueError("alpha_ipp must be a finite scalar between 0 and 1.") from error
+            interval = self.parameter_set.ipp_interval
+            # 2026-11-24: validate hospital-IPP controls before scheduling or sampling to make invalid experiments explicit.
+            if not np.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+                raise ValueError("alpha_ipp must be a finite scalar between 0 and 1.")
+            if isinstance(interval, bool) or not isinstance(interval, (int, np.integer)) or interval <= 0:
+                raise ValueError("ipp_interval must be a positive integer.")
+            # 2026-11-24: unscheduled or zero-accuracy hospital IPP must not sample people or consume random draws.
+            if alpha == 0.0 or (dt + 1) % interval != 0:
+                return
+
+        # 2026-11-24: select the unchanged cancer and all-other eligibility groups without Person-level updates.
+        all_person_index = np.arange(self.num_population)
+        is_new_patient = np.zeros(self.num_population, dtype=bool)
+        is_new_patient[self.idx_new_patient] = True
+        idx_susceptible = all_person_index[~is_new_patient]
+        idx_susceptible_info_prov = np.random.choice(
+            idx_susceptible,
+            size=int(np.round(len(idx_susceptible) * self.parameter_set.gamma_s)),
+            replace=False,
+        )
+        idx_patient_info_prov = np.random.choice(
+            self.idx_new_patient,
+            size=int(np.round(len(self.idx_new_patient) * self.parameter_set.gamma_c)),
+            replace=False,
+        )
+        idx_info_prov = np.concatenate((idx_susceptible_info_prov, idx_patient_info_prov))
 
         # Regional-level IPP
         if self.parameter_set.prov_type == 1 and self.parameter_set.quality_model_version != 'phq_driven_prq':
-            temp_PRQ = self.df_Hospital_info.groupby('idx_REGION')['OQ_objective_quality'].mean().values
-            for idx_person in np.concatenate((idx_susceptible_info_prov, idx_patient_info_prov)):
-                self.arr_Person[idx_person].PRQ = np.random.normal(temp_PRQ, 
-                                                    self.parameter_set.sigma_ip, 
-                                                    len(temp_PRQ))
+            # 2026-11-24: aggregate OHQ by Simulation region index to align regional means with PRQ columns.
+            current_ohq = self.df_Hospital_info['OQ_objective_quality'].to_numpy(dtype=float)
+            hospital_count_by_region = np.bincount(
+                self.arr_hospital_region, minlength=self.num_region
+            )
+            mean_ohq_by_region = np.bincount(
+                self.arr_hospital_region,
+                weights=current_ohq,
+                minlength=self.num_region,
+            ) / hospital_count_by_region
+            noise = np.random.normal(
+                loc=0.0,
+                scale=self.parameter_set.sigma_ip,
+                size=(len(idx_info_prov), self.num_region),
+            )
+            self.arr_population_PRQ[idx_info_prov, :] = mean_ohq_by_region[np.newaxis, :] + noise
         
         # Hospital-level IPP
         if self.parameter_set.prov_type == 2:
-            for idx_person in np.concatenate((idx_susceptible_info_prov, idx_patient_info_prov)):
-                self.arr_Person[idx_person].PHQ = np.random.normal(self.achv_OHQ[dt], 
-                                                    self.parameter_set.sigma_ip, 
-                                                    len(self.df_Hospital_info))
+            # 2026-11-24: move selected PHQ rows alpha_ipp of the way toward current post-VOR/action OHQ, without IPP noise.
+            current_ohq = self.df_Hospital_info['OQ_objective_quality'].to_numpy(dtype=float)
+            self.arr_population_PHQ[idx_info_prov, :] += alpha * (
+                current_ohq[np.newaxis, :]
+                - self.arr_population_PHQ[idx_info_prov, :]
+            )
 
     # gym과 호환을 위한 one step transition function
     def advance_one_timestep(self, dt, hospital_action=None):
@@ -1216,9 +1259,6 @@ class Simulation:
 
         if self.parameter_set.prov_type > 0:
             self.Information_Provision_Policy(dt)
-            for idx_person in range(len(self.arr_Person)):
-                self.arr_population_PHQ[idx_person] = self.arr_Person[idx_person].PHQ
-                self.arr_population_PRQ[idx_person] = self.arr_Person[idx_person].PRQ
                     
         # 2026-10-08: PHQ 갱신 뒤 PRQ를 누적 갱신하며, 이 PRQ는 다음 timestep choice에 반영된다.
         self.update_PRQ_from_PHQ(dt)
